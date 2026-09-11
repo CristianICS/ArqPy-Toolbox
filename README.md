@@ -219,3 +219,23 @@ After reproducing the complete toolbox structure, compress the final application
 ```bash
 tar -czf ArqPy-1.2.1.tar.gz -C "C:/ArqPy-Toolbox-1.2.1" .
 ```
+
+## Citation
+
+If you use **ArqPy** in your work, please consider citing it:
+
+```bibtex
+@article{s26175478,
+  author         = {Iranzo, Cristian and Uribe, Paula and Angás, Jorge and Pérez-Cabello, Fernando},
+  title          = {ArqPy: A Python Toolbox for Remote Sensing Image Preprocessing and AI-Assisted Interpretation of Derived Products for Archaeological Prospection},
+  journal        = {Sensors},
+  volume         = {26},
+  year           = {2026},
+  number         = {17},
+  article-number = {5478},
+  url            = {https://www.mdpi.com/1424-8220/26/17/5478},
+  issn           = {1424-8220},
+  doi            = {10.3390/s26175478}
+}
+```
+
