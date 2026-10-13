@@ -217,7 +217,8 @@ Toolbox
 After reproducing the complete toolbox structure, compress the final application from a Bash terminal with:
 
 ```bash
-tar -czvf ArqPy-1.3.0.tar.gz -C "C:/ArqPy-Toolbox-1.3.0" .
+cd /c/ArqPy-<version>
+tar -czvf ArqPy-<version>.tar.gz -C "C:/ArqPy-<version>" .
 ```
 
 where
