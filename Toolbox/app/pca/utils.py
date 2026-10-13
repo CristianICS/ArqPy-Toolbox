@@ -225,4 +225,3 @@ def run_pca(
 
     if outmatrix:
         print(f"Transformation matrix saved to: {outmatrix}")
-    print(f"PCA image saved to: {out_path}")

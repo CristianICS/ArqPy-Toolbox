@@ -159,5 +159,6 @@ class PcaJob:
                             as_cog=True,
                         )
             output_paths.append(out_path)
+            progress(f"PCA image saved to: {out_path}")
 
         return output_paths
