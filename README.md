@@ -217,8 +217,16 @@ Toolbox
 After reproducing the complete toolbox structure, compress the final application from a Bash terminal with:
 
 ```bash
-tar -czf ArqPy-1.2.1.tar.gz -C "C:/ArqPy-Toolbox-1.2.1" .
+tar -czvf ArqPy-1.3.0.tar.gz -C "C:/ArqPy-Toolbox-1.3.0" .
 ```
+
+where
+
+- `-c` creates a new archive.
+- `-z` compresses it with gzip.
+- `-v` lists files as they're processed. You can drop it if you don't want the output.
+- `-f ArqPy-1.3.0.tar.gz` sets the output file name.
+- `-C "C:/ArqPy-Toolbox-1.3.0"` changes into the app directory.
 
 ## Citation
 
