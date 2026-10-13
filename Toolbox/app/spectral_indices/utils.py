@@ -19,9 +19,18 @@ from osgeo import gdal
 from osgeo_utils.gdal_calc import main as gdal_calc
 
 from core.clip import clip_raster_to_vector
-from core.raster_io import RasterProfile, gdal_creation_options
+from core.raster_io import (
+    LOSSLESS,
+    gdal_creation_options,
+    profile_for,
+    temp_tif,
+    translate_to_cog,
+)
 
 INDICES_PATH = files("spectral_indices.data") / "indices.json"
+
+# `gdal_calc` is run with `--type Float32`.
+_INDEX_DTYPE = "float32"
 
 
 class MissingBandsError(ValueError):
@@ -57,14 +66,11 @@ def compute_index(
     out_dir: Path,
     clip_layer_path: Optional[Path] = None,
     overwrite: bool = False,
-    profile: RasterProfile = RasterProfile(
-        compress="DEFLATE", predictor=3, tiled=False,
-        blockxsize=None, blockysize=None, bigtiff=None,
-    ),
+    compression: str = LOSSLESS,
 ) -> Optional[Path]:
     """
-    Compute one spectral index for `img_path` via `gdal_calc` and,
-    optionally, clip it to a vector cutline.
+    Compute one spectral index for `img_path` via `gdal_calc` and write it
+    as a Cloud Optimized GeoTIFF, optionally clipped to a vector cutline.
 
     :index_key: Index short name. Must be a key in indices.json.
     :img_path: Image path which bands will use to compute the indices.
@@ -73,7 +79,9 @@ def compute_index(
     :out_dir: Directory to store the computed index.
     :clip_layer_path: An optional vector layer path to clip the index to.
     :overwrite: Recompute an index if it exists in out_dir.
-    :profile: GDAL creation-option profile for the computed index raster.
+    :compression: `core.raster_io` compression mode of the final COG
+        (lossless, or near-lossless LERC within the "index" tolerance).
+        The intermediate `gdal_calc` raster is always lossless.
 
     Returns the path of the computed (and, if requested, clipped) raster,
     or None if it was already computed and `overwrite` is False.
@@ -154,46 +162,47 @@ def compute_index(
         band_idx = name_to_band[nm]  # 1-based
         argv += [f"-{L}", str(img_path), f"--{L}_band", str(band_idx)]
 
-    img_suffix = "_temp" if clip_layer_path else ""
-
-    out_path = Path(
-        out_dir,
-        f"{index_key}_{img_path.stem}{img_suffix}.tif"
-    )
-
-    argv += [
-        # Integer constant
-        "--calc", letter_formula,
-        "--type", "Float32",
-        "--NoDataValue", f"{nodata}",
-        "--outfile", str(out_path)
-    ]
-    if overwrite:
-        argv.append("--overwrite")
-    else:
-        if out_path.exists():
+    out_path = Path(out_dir, f"{index_key}_{img_path.stem}.tif")
+    if out_path.exists():
+        if not overwrite:
             return None
+        # `gdal.Warp` (clip) would write into an existing file, not replace it.
+        out_path.unlink()
 
-    for co in gdal_creation_options(profile):
-        argv += ["--co", co]
+    # `gdal_calc` can't write a COG directly (the COG driver has no
+    # Create()), so it writes a lossless tiled GeoTIFF first; only the
+    # final COG uses `compression`.
+    lossless_profile = profile_for(_INDEX_DTYPE, "index", LOSSLESS)
+    final_profile = profile_for(_INDEX_DTYPE, "index", compression)
 
     print("formula ->", formula)
     print("name -> GDAL letter:", name_to_letter)
     print("rewritten formula:", letter_formula)
 
-    gdal_calc(argv)
+    with temp_tif(out_dir, f"{index_key}_{img_path.stem}_temp") as calc_path:
+        argv += [
+            "--calc", letter_formula,
+            "--type", "Float32",
+            "--NoDataValue", f"{nodata}",
+            "--outfile", str(calc_path),
+            # `temp_tif` pre-creates the (empty) file.
+            "--overwrite",
+        ]
+        for co in gdal_creation_options(lossless_profile):
+            argv += ["--co", co]
 
-    if clip_layer_path:
-        out_clip_path = out_path.with_stem(
-            out_path.stem.replace(img_suffix, "")
-        )
-        clip_raster_to_vector(
-            out_path, clip_layer_path, out_clip_path,
-            nodata=nodata,
-            profile=RasterProfile(compress="DEFLATE", predictor=3, bigtiff="IF_SAFER"),
-            as_cog=True,
-        )
-        out_path.unlink()
-        return out_clip_path
+        # `gdal_calc` prints its own errors and returns 1 instead of raising.
+        if gdal_calc(argv) != 0:
+            raise RuntimeError(f"gdal_calc failed for index {index_key}")
+
+        if clip_layer_path:
+            clip_raster_to_vector(
+                calc_path, clip_layer_path, out_path,
+                nodata=nodata,
+                profile=final_profile,
+                as_cog=True,
+            )
+        else:
+            translate_to_cog(calc_path, out_path, final_profile)
 
     return out_path

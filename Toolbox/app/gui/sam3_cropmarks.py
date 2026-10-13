@@ -5,7 +5,13 @@ import PySimpleGUI as sg
 from sam3_cropmarks import parse_rgb_bands
 from sam3_cropmarks.job import Sam3CropmarksJob
 
-from .framework import ToolWindow, output_folder_row, resolve_output_folder_value
+from .framework import (
+    ToolWindow,
+    compression_row,
+    output_folder_row,
+    resolve_compression_value,
+    resolve_output_folder_value,
+)
 
 
 def run_job(values: dict):
@@ -37,6 +43,7 @@ def run_job(values: dict):
             overlap=int(values["-OVERLAP-"]),
             checkpoint=checkpoint,
             overwrite=values["-OVERWRITE-"],
+            compression=resolve_compression_value(values),
         )
         job.validate()
         job.run(progress=print)
@@ -84,4 +91,9 @@ def main():
         ],
         [sg.Checkbox("Overwrite existing outputs", key="-OVERWRITE-", default=False)],
     )
+    tw.add_rows(*compression_row())
+    tw.add_rows([sg.Text(
+        "Applies to the confidence raster; the crop-mark mask is always lossless",
+        font=("Arial", 10, "italic"),
+    )])
     tw.run(job=run_job, start_message="Starting crop-mark segmentation...")

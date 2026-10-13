@@ -10,7 +10,7 @@ import numpy as np
 from osgeo import gdal
 from scipy import io
 
-from core.raster_io import RasterProfile, create_gtiff_like
+from core.raster_io import create_gtiff_like, profile_for, raster_dtype
 from .grid import align_raster_grids
 
 
@@ -95,10 +95,7 @@ def _mat_to_geotiff(mat_path: Path, reference_pan: Path, output_path: Path):
             gdal.GDT_UInt16,
             geotransform=reference.GetGeoTransform(),
             projection=reference.GetProjection(),
-            profile=RasterProfile(
-                compress="DEFLATE", predictor=2, tiled=True,
-                blockxsize=None, blockysize=None, bigtiff=None,
-            ),
+            profile=profile_for(output.dtype),
         )
         for band_index in range(output.shape[2]):
             destination.GetRasterBand(band_index + 1).WriteArray(output[:, :, band_index])
@@ -129,6 +126,15 @@ def run_pansharpening(
         raise ValueError(f"Unsupported sensor: {sensor}")
     if epochs < 0:
         raise ValueError("Epochs cannot be negative.")
+    # The result is written as uint16, which truncates float reflectance
+    # (0-1) to 0 or 1.
+    for label, path in (("MS", ms_path), ("PAN", pan_path)):
+        if not np.issubdtype(raster_dtype(path), np.integer):
+            raise ValueError(
+                f"The {label} raster must hold integer values (raw DN, or "
+                "reflectance scaled to integers): the pansharpened output "
+                f"is UInt16. {path.name} is {raster_dtype(path)}."
+            )
     output_folder.mkdir(parents=True, exist_ok=True)
     zpnn_root = _zpnn_root()
 
@@ -191,5 +197,8 @@ def run_pansharpening(
             raise RuntimeError(f"Z-PNN did not create its expected output: {output_mat}")
         print("Writing the georeferenced pansharpened GeoTIFF...")
         _mat_to_geotiff(output_mat, alignment.pan_path, output_tif)
+        # The MAT result is a full-resolution duplicate of the GeoTIFF and
+        # nothing reads it afterwards.
+        output_mat.unlink()
 
-    return {"tif": output_tif, "mat": output_mat}
+    return {"tif": output_tif}

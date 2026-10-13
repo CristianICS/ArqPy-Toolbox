@@ -8,8 +8,10 @@ from mae.job import MaeJob
 from .framework import (
     ToolWindow,
     clip_vector_row,
+    compression_row,
     folder_input_row,
     resolve_clip_vector_value,
+    resolve_compression_value,
 )
 
 _NORMALIZATION_LABELS = {
@@ -55,6 +57,7 @@ def run_job(values: dict):
             clip_vector=clip_vector,
             tile_overlap=tile_overlap,
             normalization=normalization,
+            compression=resolve_compression_value(values),
         )
         job.validate()
         job.run(progress=print)
@@ -117,4 +120,5 @@ def main():
         ],
     )
     tw.add_rows(*clip_vector_row())
+    tw.add_rows(*compression_row())
     tw.run(job=run_job, start_message="Starting computations...")

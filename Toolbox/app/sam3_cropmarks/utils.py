@@ -10,11 +10,17 @@ from typing import Callable, Iterable
 
 import numpy as np
 import rasterio
+import rasterio.shutil
 import torch
 from PIL import Image
 from rasterio.windows import Window
 
-from core.raster_io import RasterProfile, rasterio_profile_kwargs
+from core.raster_io import (
+    LOSSLESS,
+    NEAR_LOSSLESS,
+    profile_for,
+    rasterio_profile_kwargs,
+)
 from core.tiling import axis_tile_starts
 
 
@@ -74,17 +80,30 @@ def build_processor(confidence: float, checkpoint: Path | None = None):
     return Sam3Processor(model, device=device, confidence_threshold=confidence), device
 
 
-def _output_band_profile(source_profile: dict, dtype: str, predictor: int) -> dict:
-    """A single-band GTiff profile derived from a source raster's profile."""
+def _output_band_profile(source_profile: dict, dtype: str) -> dict:
+    """A lossless single-band GTiff profile derived from a source raster's
+    profile (block layout included), for the outputs that tiles are merged
+    into with read-modify-write passes."""
     profile = source_profile.copy()
     profile.update(
         count=1, dtype=dtype, nodata=0,
-        **rasterio_profile_kwargs(RasterProfile(
-            compress="DEFLATE", predictor=predictor, tiled=False,
-            blockxsize=None, blockysize=None, bigtiff="IF_SAFER",
+        **rasterio_profile_kwargs(profile_for(
+            dtype, tiled=False, blockxsize=None, blockysize=None,
         )),
     )
     return profile
+
+
+def _encode_near_lossless(src_path: Path, dst_path: Path, product: str) -> None:
+    """Copy the finished lossless `src_path` to `dst_path` as a tiled
+    near-lossless GTiff. LERC is applied once here rather than in the
+    read-modify-write passes, where every rewrite of a block would
+    re-quantize it."""
+    with rasterio.open(src_path) as src:
+        dtype = src.dtypes[0]
+    creation = rasterio_profile_kwargs(profile_for(dtype, product, NEAR_LOSSLESS))
+    driver = creation.pop("driver")
+    rasterio.shutil.copy(src_path, dst_path, driver=driver, **creation)
 
 
 def _tensor_to_numpy(value) -> np.ndarray:
@@ -109,8 +128,13 @@ def process_image(
     overlap: int,
     overwrite: bool = False,
     progress: Callable[[str], None] = print,
+    compression: str = LOSSLESS,
 ) -> dict[str, int | Path]:
-    """Segment one raster and write union, confidence, and instance outputs."""
+    """Segment one raster and write union, confidence, and instance outputs.
+
+    `compression` (a `core.raster_io` mode) applies to the confidence
+    raster only; the uint8 mask is always lossless.
+    """
     mask_path = output_folder / f"{image_path.stem}_crop_marks.tif"
     confidence_path = output_folder / f"{image_path.stem}_crop_mark_confidence.tif"
     csv_path = output_folder / f"{image_path.stem}_crop_mark_instances.csv"
@@ -122,6 +146,8 @@ def process_image(
     temp_mask = mask_path.with_suffix(".partial.tif")
     temp_confidence = confidence_path.with_suffix(".partial.tif")
     temp_csv = csv_path.with_suffix(".partial.csv")
+    temp_confidence_encoded = confidence_path.with_suffix(".encoded.partial.tif")
+    temporaries = (temp_mask, temp_confidence, temp_csv, temp_confidence_encoded)
 
     try:
         with rasterio.open(image_path) as source:
@@ -131,8 +157,8 @@ def process_image(
                     f"{max(rgb_bands)} was requested."
                 )
 
-            mask_profile = _output_band_profile(source.profile, "uint8", predictor=1)
-            confidence_profile = _output_band_profile(source.profile, "float32", predictor=3)
+            mask_profile = _output_band_profile(source.profile, "uint8")
+            confidence_profile = _output_band_profile(source.profile, "float32")
 
             windows = list(iter_windows(source.width, source.height, tile_size, overlap))
             instance_count = 0
@@ -199,13 +225,20 @@ def process_image(
                         np.maximum(old_confidence, confidence), 1, window=window
                     )
 
+        finished_confidence = temp_confidence
+        if compression == NEAR_LOSSLESS:
+            _encode_near_lossless(
+                temp_confidence, temp_confidence_encoded, "confidence")
+            temp_confidence.unlink()
+            finished_confidence = temp_confidence_encoded
+
         for temporary, final in zip(
-            (temp_mask, temp_confidence, temp_csv), outputs
+            (temp_mask, finished_confidence, temp_csv), outputs
         ):
             os.replace(temporary, final)
         return {"image": image_path, "instances": instance_count, "skipped": 0}
     except Exception:
-        for path in (temp_mask, temp_confidence, temp_csv):
+        for path in temporaries:
             path.unlink(missing_ok=True)
         raise
 
@@ -242,6 +275,7 @@ def process_input(
     checkpoint: Path | None = None,
     overwrite: bool = False,
     progress: Callable[[str], None] = print,
+    compression: str = LOSSLESS,
 ) -> list[dict[str, int | Path]]:
     """Load SAM 3 once, then process one GeoTIFF or a folder of GeoTIFFs."""
     images = _find_images(input_path)
@@ -264,7 +298,7 @@ def process_input(
             progress(f"Image {number}/{len(images)}: {image_path.name}")
             results.append(process_image(
                 image_path, output_folder, processor, prompt, rgb_bands,
-                tile_size, overlap, overwrite, progress,
+                tile_size, overlap, overwrite, progress, compression,
             ))
     return results
 
@@ -280,6 +314,7 @@ def process_folder(
     checkpoint: Path | None = None,
     overwrite: bool = False,
     progress: Callable[[str], None] = print,
+    compression: str = LOSSLESS,
 ) -> list[dict[str, int | Path]]:
     """Backward-compatible wrapper for processing a folder of GeoTIFFs."""
     if not input_folder.is_dir():
@@ -295,4 +330,5 @@ def process_folder(
         checkpoint=checkpoint,
         overwrite=overwrite,
         progress=progress,
+        compression=compression,
     )

@@ -313,6 +313,8 @@ class WV3(WorldView):
     # spectral index band mapping).
     BAND_KEYS = ["C", "B", "G", "Y", "R", "RE1", "N", "N2"]
     BAND_POS = [1, 2, 3, 4, 5, 6, 7, 8]
+    # Default PCA combinations; ids match the full sweep (`generate_combis`).
+    PCA_COMBIS_CSV = files("sensors.data") / "wv3_pca_combinations.csv"
 
     def __init__(self, image_dir: Path):
         """
@@ -385,6 +387,8 @@ class LG06(WorldView):
     # spectral index band mapping).
     BAND_KEYS = ["C", "B", "G", "Y", "R", "RE1", "RE2", "N"]
     BAND_POS = [1, 2, 3, 4, 5, 6, 7, 8]
+    # Default PCA combinations; ids match the full sweep (`generate_combis`).
+    PCA_COMBIS_CSV = files("sensors.data") / "legion6_pca_combinations.csv"
 
     def __init__(self, image_dir: Path):
         """

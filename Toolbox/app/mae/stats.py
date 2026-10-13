@@ -4,6 +4,14 @@ import csv
 
 import rasterio
 import numpy as np
+from rasterio.windows import Window
+
+from core.tiling import iter_blocks
+
+# Side of the windows `compute_raster_stats` reads one at a time, and the
+# approximate number of values it keeps for the percentiles.
+STATS_BLOCK_SIZE = 1024
+STATS_MAX_SAMPLES = 1_000_000
 
 @dataclass(slots=True)
 class Stats:
@@ -127,35 +135,65 @@ def compute_raster_stats(tif_path: str| Path, band = 1) -> tuple[Stats, np.ndarr
     """
     Compute basic statistics for a raster band using rasterio.
 
+    The band is read one window at a time, so it is never held in memory.
+    Mean, min, max and std use every valid pixel. Median, p90 and p95 use
+    a regular subsample of about `STATS_MAX_SAMPLES` valid pixels (every
+    valid pixel when the raster has fewer).
+
     Parameters
     ----------
     path : str | Path
         Path to the raster file.
     band : int, optional
         Band number to read (default is 1).
+
+    Returns
+    -------
+    (Stats, np.ndarray)
+        The statistics and the subsample of valid values.
     """
     tif_path = Path(tif_path)
 
-    # Read as a masked array so nodata values are ignored automatically
-    with rasterio.open(tif_path) as src:
-        data = src.read(band, masked=True)
+    count = 0
+    total = 0.0
+    total_sq = 0.0
+    vmin, vmax = np.inf, -np.inf
+    samples = []
 
-    # Keep only valid pixels as a 1D array for fast vectorized statistics
-    values = data.compressed()  # type: np.ndarray
+    with rasterio.open(tif_path) as src:
+        sample_step = max(1, src.width * src.height // STATS_MAX_SAMPLES)
+        for block in iter_blocks(
+                src.width, src.height, STATS_BLOCK_SIZE, STATS_BLOCK_SIZE):
+            # Read as a masked array so nodata values are ignored automatically
+            data = src.read(band, masked=True, window=Window(
+                block.xoff, block.yoff, block.xsize, block.ysize))
+            block_values = data.compressed().astype(np.float64)
+            if block_values.size == 0:
+                continue
+            count += block_values.size
+            total += block_values.sum()
+            total_sq += np.square(block_values).sum()
+            vmin = min(vmin, block_values.min())
+            vmax = max(vmax, block_values.max())
+            samples.append(block_values[::sample_step])
 
     # Guard against empty rasters (e.g. all pixels are nodata)
-    if values.size == 0:
+    if count == 0:
         raise ValueError("Raster band contains no valid data.")
-    
+
+    values = np.concatenate(samples)
+    mean = total / count
+    median, p90, p95 = np.percentile(values, (50, 90, 95))
+
     stats = Stats(
         id = tif_path.stem,
-        mean=values.mean(),
-        median=np.median(values),
-        min=values.min(),
-        p90=np.percentile(values, 90),
-        p95=np.percentile(values, 95),
-        max=values.max(),
-        std=values.std()
+        mean=mean,
+        median=median,
+        min=vmin,
+        p90=p90,
+        p95=p95,
+        max=vmax,
+        std=np.sqrt(max(total_sq / count - mean ** 2, 0.0))
     )
 
     return stats, values

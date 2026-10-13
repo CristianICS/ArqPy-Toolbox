@@ -9,9 +9,11 @@ from sensors import SENSORS
 from .framework import (
     ToolWindow,
     clip_vector_row,
+    compression_row,
     folder_input_row,
     output_folder_row,
     resolve_clip_vector_value,
+    resolve_compression_value,
     resolve_output_folder_value,
     sensor_combo_row,
 )
@@ -50,6 +52,7 @@ def run_job(values: dict):
             atm_formula=values["-ATM-"],
             scale=scale,
             clip_vector=clip_vector,
+            compression=resolve_compression_value(values),
         )
         job.validate()
         job.run(progress=print)
@@ -82,4 +85,11 @@ def main():
         [sg.Text("Tap 0 to skip.", font=("Arial", 10, "italic"))],
         [sg.Input(default_text='0', key='-SCALE-')],
     )
+    # Near-lossless only applies with Scale = 0 (float32 reflectance);
+    # scaled int16 outputs are always lossless.
+    tw.add_rows(*compression_row(warning=(
+        "Warning: if this output feeds pansharpening or other tools, keep it\n"
+        "Lossless. Near-lossless errors are amplified by later steps, so the\n"
+        "final product is no longer guaranteed to stay within the error bound."
+    )))
     tw.run(job=run_job, start_message="Starting atmospheric correction...")

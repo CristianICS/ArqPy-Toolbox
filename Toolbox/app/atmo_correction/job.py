@@ -12,7 +12,14 @@ from typing import List, Optional, Type
 
 from core.clip import clip_raster_to_vector
 from core.progress import DEFAULT_PROGRESS, Progress
-from core.raster_io import RasterProfile
+from core.raster_io import (
+    COMPRESSION_MODES,
+    LOSSLESS,
+    RasterProfile,
+    nodata_for,
+    raster_dtype,
+    temp_tif,
+)
 
 from .formulas import FORMULAS
 from .streaming import OutputSpec, correct_raster_streaming
@@ -33,6 +40,7 @@ class AtmoCorrectionJob:
     atm_formula: str
     scale: int
     clip_vector: Optional[Path] = None
+    compression: str = LOSSLESS
 
     def validate(self) -> None:
         if not self.image_dir.exists():
@@ -43,6 +51,8 @@ class AtmoCorrectionJob:
             raise ValueError(f"Unknown atmospheric correction formula: {self.atm_formula}")
         if self.scale < 0:
             raise ValueError("The scale value must be positive.")
+        if self.compression not in COMPRESSION_MODES:
+            raise ValueError(f"Unknown compression mode: {self.compression}")
 
     def run(self, progress: Progress = DEFAULT_PROGRESS) -> AtmoCorrectionResult:
         image = self.sensor_cls(self.image_dir)
@@ -58,63 +68,77 @@ class AtmoCorrectionJob:
             progress(init_message)
             progress("-" * len(init_message) * 2)
 
-            out_clip_path = None
-            if self.clip_vector is not None:
+            if self.clip_vector is None:
+                self._correct(image, img_type, img_path, img_path,
+                              scale, scale_to_integer, corrected_paths, progress)
+                continue
+
+            # The clip intermediate is a fresh, randomly named temp file,
+            # deleted when the `with` block exits (even on error), so it can
+            # never be an input or any other existing file.
+            with temp_tif(self.out_folder, f"{img_path.stem}_temp") as out_clip_path:
                 progress("Clipping...")
-                out_clip_path = self.out_folder / (img_path.stem + "_temp.tif")
+                # Lossless intermediate of the raw (integer) DN image, so
+                # PREDICTOR=2 is the right predictor here. Its no-data must
+                # fit the DN dtype (0 for unsigned DN): the correction masks
+                # the pixels equal to the declared no-data.
                 clip_raster_to_vector(
                     img_path, self.clip_vector, out_clip_path,
-                    nodata=-9999,
+                    nodata=nodata_for(raster_dtype(img_path)),
                     profile=RasterProfile(
                         compress="DEFLATE", predictor=2, tiled=True,
                         blockxsize=None, blockysize=None, bigtiff=None,
                     ),
                     as_cog=False,
                 )
-
-            if self.atm_formula == "DOS3":
-                if img_type == "mul":
-                    image.START_BAND = "C"
-                elif img_type == "pan":
-                    image.START_BAND = "P"
-
-                band_params = image.extract_params_per_band(img_path)
-                ctx_params = image.extract_ctx_params(img_path)
-
-                params = SensorParams(
-                    self.sensor_name, band_params, ctx_params,
-                    self.sensor_cls.radiometric_calibration,
-                )
-
-                outname = img_path.stem + f"_{self.atm_formula}.tif"
-                out_path = self.out_folder / outname
-
-                correction_input = out_clip_path if out_clip_path is not None else img_path
-
-                progress("Starting DOS3 correction...")
-                band_formulas = [self.atm_formula] * len(band_params)
-                correct_raster_streaming(
-                    infile=correction_input,
-                    outfile=out_path,
-                    band_formulas=band_formulas,
-                    sensor=params,
-                    out=OutputSpec(
-                        dtype="float32",
-                        nodata=-9999,
-                        scale=scale,
-                        compress="DEFLATE",
-                        predictor=2,
-                        blocksize=512,
-                        tiled=True,
-                        cog=True,
-                    ),
-                    build_overviews=True,
-                    scale_to_int=scale_to_integer,
-                )
-                corrected_paths.append(out_path)
-
-                if out_clip_path is not None:
-                    progress("Removing temp files...")
-                    out_clip_path.unlink()
+                self._correct(image, img_type, img_path, out_clip_path,
+                              scale, scale_to_integer, corrected_paths, progress)
+                progress("Removing temp files...")
 
         return AtmoCorrectionResult(corrected_paths=corrected_paths)
+
+    def _correct(self, image, img_type: str, img_path: Path,
+                 correction_input: Path, scale: Optional[int],
+                 scale_to_integer: bool, corrected_paths: List[Path],
+                 progress: Progress) -> None:
+        """Correct `correction_input` (the raw image or its clipped temp
+        copy); metadata and the output name come from `img_path`."""
+        if self.atm_formula != "DOS3":
+            return
+
+        if img_type == "mul":
+            image.START_BAND = "C"
+        elif img_type == "pan":
+            image.START_BAND = "P"
+
+        band_params = image.extract_params_per_band(img_path)
+        ctx_params = image.extract_ctx_params(img_path)
+
+        params = SensorParams(
+            self.sensor_name, band_params, ctx_params,
+            self.sensor_cls.radiometric_calibration,
+        )
+
+        outname = img_path.stem + f"_{self.atm_formula}.tif"
+        out_path = self.out_folder / outname
+
+        progress("Starting DOS3 correction...")
+        band_formulas = [self.atm_formula] * len(band_params)
+        correct_raster_streaming(
+            infile=correction_input,
+            outfile=out_path,
+            band_formulas=band_formulas,
+            sensor=params,
+            out=OutputSpec(
+                dtype="float32",
+                nodata=-9999,
+                scale=scale,
+                compression=self.compression,
+                blocksize=512,
+                tiled=True,
+                cog=True,
+            ),
+            build_overviews=True,
+            scale_to_int=scale_to_integer,
+        )
+        corrected_paths.append(out_path)

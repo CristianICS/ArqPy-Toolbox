@@ -7,28 +7,67 @@ import torch.nn.functional as F
 import timm
 import fiona
 import rasterio
+import rasterio.shutil
 from affine import Affine
+from rasterio.features import geometry_mask, geometry_window
 from rasterio.windows import Window
-from rasterio.mask import mask
 from rasterio.warp import transform_geom
 
-from core.raster_io import RasterProfile, rasterio_profile_kwargs
+from core.raster_io import (
+    LOSSLESS,
+    NEAR_LOSSLESS,
+    percentile_range,
+    profile_for,
+    rasterio_cog_kwargs,
+    rasterio_profile_kwargs,
+)
 from core.tiling import axis_tile_starts, iter_blocks
 
 DEFAULT_TILE_OVERLAP = 256
 DEFAULT_HANN_MIN_WEIGHT = 1e-3
 GTIFF_BLOCK_SIZE = 256
+# Side of the windows `clip_mae` processes one at a time.
+CLIP_BLOCK_SIZE = 2048
+
+# Layout/codec keys a source profile may carry that must not leak into a
+# new output's creation options.
+_LAYOUT_KEYS = ("tiled", "blockxsize", "blockysize", "compress", "predictor")
 
 
-def _set_tiled_gtiff_profile(profile: dict, predictor: int) -> None:
-    """Set valid tiled-GeoTIFF options without inherited block dimensions."""
-    profile.pop("blockxsize", None)
-    profile.pop("blockysize", None)
-    profile.update(rasterio_profile_kwargs(RasterProfile(
-        compress="DEFLATE", predictor=predictor, tiled=True,
+def _tiled_gtiff_kwargs(
+    dtype, mode: str = LOSSLESS, value_range: float | None = None,
+) -> dict:
+    """Rasterio creation kwargs of a tiled GeoTIFF of `dtype`.
+
+    Lossless: DEFLATE with the predictor derived from `dtype` (3 for
+    floats, 2 for integers). Near-lossless: LERC with the "saliency"
+    tolerance scaled by `value_range` (see `core.raster_io.profile_for`).
+    """
+    return rasterio_profile_kwargs(profile_for(
+        dtype, "saliency", mode, value_range=value_range,
         blockxsize=GTIFF_BLOCK_SIZE, blockysize=GTIFF_BLOCK_SIZE,
         bigtiff="IF_SAFER",
-    )))
+    ))
+
+
+def _set_tiled_gtiff_profile(profile: dict) -> None:
+    """Set lossless tiled-GeoTIFF options on `profile`, without the block
+    dimensions and codec it inherited from a source raster."""
+    for key in _LAYOUT_KEYS:
+        profile.pop(key, None)
+    profile.update(_tiled_gtiff_kwargs(profile["dtype"]))
+
+
+def _temp_sibling(path: Path) -> Path:
+    """A fresh, randomly named temporary path next to `path`."""
+    return path.with_stem(f"{path.stem}_temp_{uuid4().hex}")
+
+
+def _valid_value_range(values: np.ndarray, nodata) -> float:
+    """p99 - p1 of `values`, excluding NaN and `nodata`."""
+    if nodata is not None and not np.isnan(nodata):
+        values = values[values != nodata]
+    return percentile_range(values)
 
 
 def parse_mae_bands(value: str) -> tuple[int, int, int]:
@@ -189,7 +228,7 @@ def tilling(
                     }
                 )
                 if compression:
-                    _set_tiled_gtiff_profile(tile_profile, predictor=2)
+                    _set_tiled_gtiff_profile(tile_profile)
 
                 tiles_meta[tile_id] = {
                     "y": y,
@@ -375,7 +414,8 @@ def compute_mae_batch(
     bands: tuple[int, int, int] = (1, 1, 1),
     band_stats: dict[int, tuple[float, float]] | None = None,
     hann_min_weight: float = DEFAULT_HANN_MIN_WEIGHT,
-    out_suffix = "_mae.tif"
+    out_suffix = "_mae.tif",
+    compression: str = LOSSLESS,
 ):
     """
     Apply MAE ViT to all the image tiles.
@@ -384,6 +424,8 @@ def compute_mae_batch(
     :band_stats: Passed straight through to `compute_mae`; also recorded as
         the `MAE_NORMALIZATION` tag so a later run with a different
         normalization mode doesn't reuse a stale cached tile.
+    :compression: `core.raster_io` mode of the merged output; the
+        prediction tiles are always lossless.
     """
     if not tiles_meta:
         raise ValueError("No source tiles were provided for MAE inference.")
@@ -416,6 +458,7 @@ def compute_mae_batch(
             band_stats=band_stats,
         )
 
+        _set_tiled_gtiff_profile(out_meta)
         with rasterio.open(out_tile_path, "w", **out_meta) as dst:
             dst.write(heatmap, 1)
             dst.update_tags(
@@ -430,6 +473,7 @@ def compute_mae_batch(
         out_suffix,
         out_path,
         minimum_weight=hann_min_weight,
+        compression=compression,
     )
     with rasterio.open(out_path, "r+") as dst:
         overlap = next(iter(tiles_meta.values())).get("overlap", 0)
@@ -449,11 +493,19 @@ def merge_mae_tiles(
     mae_suffix: str,
     out_path: str,
     minimum_weight: float = DEFAULT_HANN_MIN_WEIGHT,
+    compression: str = LOSSLESS,
 ) -> None:
     """Blend overlapping MAE predictions using raised-Hann weights.
 
     For every output pixel this computes ``sum(S_i * w_i) / sum(w_i)``.
     Invalid prediction pixels do not contribute to either sum.
+
+    The mosaic is written one row of tiles at a time: only the output rows
+    the current tiles cover are held in memory (one tile height times the
+    output width), never the whole scene. A near-lossless `compression`
+    bounds the error relative to the mosaic's p99 - p1; that range is only
+    known once the mosaic is complete, so the mosaic is written lossless
+    to a temporary file and re-encoded at the end.
     """
     if not tiles_meta:
         raise ValueError("No MAE tiles were provided for merging.")
@@ -478,30 +530,12 @@ def merge_mae_tiles(
 
         tile_records.append((prediction_path, x, y, width, height))
 
+    # Top to bottom, so the rows above the current tile are complete.
+    tile_records.sort(key=lambda record: record[2])
     output_width = max(x + width for _, x, _, width, _ in tile_records)
     output_height = max(y + height for _, _, y, _, height in tile_records)
-    weighted_sum = np.zeros((output_height, output_width), dtype=np.float64)
-    weight_sum = np.zeros((output_height, output_width), dtype=np.float64)
-
-    for prediction_path, x, y, width, height in tile_records:
-        with rasterio.open(prediction_path) as src:
-            prediction = src.read(1, masked=True)
-
-        weights = raised_hann_window(height, width, minimum_weight)
-        values = prediction.filled(0).astype(np.float64, copy=False)
-        valid = ~np.ma.getmaskarray(prediction) & np.isfinite(values)
-        valid_weights = weights * valid
-        rows = slice(y, y + height)
-        cols = slice(x, x + width)
-        weighted_sum[rows, cols] += values * valid_weights
-        weight_sum[rows, cols] += valid_weights
-
+    buffer_height = max(height for *_, height in tile_records)
     nodata = source_nodata if source_nodata is not None else np.nan
-    mosaic = np.full((output_height, output_width), nodata, dtype=np.float32)
-    covered = weight_sum > 0
-    mosaic[covered] = (
-        weighted_sum[covered] / weight_sum[covered]
-    ).astype(np.float32)
 
     out_meta.update(
         count=1,
@@ -511,25 +545,92 @@ def merge_mae_tiles(
         width=output_width,
         transform=source_transform,
     )
-    _set_tiled_gtiff_profile(out_meta, predictor=3)
-    with rasterio.open(out_path, "w", **out_meta) as dst:
-        dst.write(mosaic, 1)
+    _set_tiled_gtiff_profile(out_meta)
+
+    out_path = Path(out_path)
+    near_lossless = compression == NEAR_LOSSLESS
+    write_path = _temp_sibling(out_path) if near_lossless else out_path
+    # Subsample of the mosaic, for its p99 - p1 (about 1 M values).
+    samples = []
+    sample_step = max(1, output_width * output_height // 1_000_000)
+
+    # Sums for the output rows [top, top + buffer_height).
+    weighted_sum = np.zeros((buffer_height, output_width), dtype=np.float64)
+    weight_sum = np.zeros((buffer_height, output_width), dtype=np.float64)
+    top = 0
+
+    try:
+        with rasterio.open(write_path, "w", **out_meta) as dst:
+            # The extra record at `output_height` writes the last rows.
+            for prediction_path, x, y, width, height in [
+                *tile_records, (None, 0, output_height, 0, 0),
+            ]:
+                if y > top:
+                    # No remaining tile starts above `y`: write the rows
+                    # [top, y) and move the sums up to start at `y`.
+                    rows = y - top
+                    covered = weight_sum[:rows] > 0
+                    block = np.full(
+                        (rows, output_width), nodata, dtype=np.float32)
+                    block[covered] = (
+                        weighted_sum[:rows][covered] / weight_sum[:rows][covered]
+                    ).astype(np.float32)
+                    dst.write(
+                        block, 1, window=Window(0, top, output_width, rows))
+                    if near_lossless:
+                        samples.append(block[covered][::sample_step])
+                    for sums in (weighted_sum, weight_sum):
+                        sums[:-rows] = sums[rows:]
+                        sums[-rows:] = 0
+                    top = y
+                if prediction_path is None:
+                    break
+
+                with rasterio.open(prediction_path) as src:
+                    prediction = src.read(1, masked=True)
+
+                weights = raised_hann_window(height, width, minimum_weight)
+                values = prediction.filled(0).astype(np.float64, copy=False)
+                valid = ~np.ma.getmaskarray(prediction) & np.isfinite(values)
+                valid_weights = weights * valid
+                rows = slice(0, height)
+                cols = slice(x, x + width)
+                weighted_sum[rows, cols] += values * valid_weights
+                weight_sum[rows, cols] += valid_weights
+
+        if near_lossless:
+            creation = _tiled_gtiff_kwargs(
+                "float32", compression,
+                percentile_range(np.concatenate(samples)),
+            )
+            rasterio.shutil.copy(write_path, out_path, **creation)
+    finally:
+        if near_lossless:
+            write_path.unlink(missing_ok=True)
 
 
-def clip_mae(inp_path: Path, clip_layer_path: Path) -> None:
-    """Clip a raster in place using a vector cutline.
+def clip_mae(
+    inp_path: Path, clip_layer_path: Path, compression: str = LOSSLESS,
+) -> None:
+    """Clip a raster in place using a vector cutline, writing a COG.
 
-    Uses fiona/rasterio.mask rather than `core.clip` (GDAL-based): the
-    `mae` conda env ships rasterio and fiona but not the GDAL Python
-    bindings, so this tool's clip step must stay GDAL-free.
+    Uses fiona/rasterio rather than `core.clip` (GDAL-based): the `mae`
+    conda env ships rasterio and fiona but not the GDAL Python bindings, so
+    this tool's clip step must stay GDAL-free.
+
+    The clip is done one window at a time into a lossless temporary
+    GeoTIFF, which is then re-encoded once as the COG, so the clipped area
+    is never held in memory. A near-lossless `compression` bounds the
+    error relative to the clipped data's p99 - p1, so `inp_path` should be
+    lossless (re-encoding LERC adds error again).
     """
-    temp_path = inp_path.with_stem(
-        f"{inp_path.stem}_temp_{uuid4().hex}"
-    )
+    clipped_path = _temp_sibling(inp_path)
+    cog_path = _temp_sibling(inp_path)
+    # Subsample of the clipped data, for its p99 - p1 (about 1 M values).
+    samples = []
 
     try:
         with rasterio.open(inp_path) as src:
-            source_tags = src.tags()
             with fiona.open(clip_layer_path) as clip_layer:
                 geometries = [
                     transform_geom(
@@ -540,28 +641,50 @@ def clip_mae(inp_path: Path, clip_layer_path: Path) -> None:
                     for feature in clip_layer
                 ]
 
-            clipped, transform = mask(
-                src,
-                geometries,
-                crop=True,
-            )
+            # Bounding window of the cutline, in `src` pixels.
+            crop = geometry_window(src, geometries)
+            nodata = 0 if src.nodata is None else src.nodata
+            dtype = src.dtypes[0]
+            sample_step = max(1, crop.width * crop.height // 1_000_000)
 
             profile = src.profile.copy()
             profile.update(
-                driver="COG",
-                height=clipped.shape[1],
-                width=clipped.shape[2],
-                transform=transform,
-                compress="DEFLATE",
-                predictor=3,
-                BIGTIFF="IF_SAFER",
+                height=crop.height,
+                width=crop.width,
+                transform=src.window_transform(crop),
             )
+            _set_tiled_gtiff_profile(profile)
 
-            with rasterio.open(temp_path, "w", **profile) as dst:
-                dst.write(clipped)
-                dst.update_tags(**source_tags)
+            with rasterio.open(clipped_path, "w", **profile) as dst:
+                dst.update_tags(**src.tags())
+                for block in iter_blocks(
+                        crop.width, crop.height,
+                        CLIP_BLOCK_SIZE, CLIP_BLOCK_SIZE):
+                    window = Window(
+                        block.xoff, block.yoff, block.xsize, block.ysize)
+                    data = src.read(window=Window(
+                        crop.col_off + block.xoff, crop.row_off + block.yoff,
+                        block.xsize, block.ysize,
+                    ))
+                    outside = geometry_mask(
+                        geometries,
+                        out_shape=(block.ysize, block.xsize),
+                        transform=dst.window_transform(window),
+                    )
+                    data[:, outside] = nodata
+                    dst.write(data, window=window)
+                    if compression == NEAR_LOSSLESS:
+                        samples.append(data.ravel()[::sample_step])
 
-        temp_path.replace(inp_path)
+        value_range = (
+            _valid_value_range(np.concatenate(samples), nodata)
+            if compression == NEAR_LOSSLESS else None
+        )
+        rasterio.shutil.copy(clipped_path, cog_path, **rasterio_cog_kwargs(
+            profile_for(dtype, "saliency", compression, value_range=value_range)
+        ))
+        cog_path.replace(inp_path)
 
     finally:
-        temp_path.unlink(missing_ok=True)
+        clipped_path.unlink(missing_ok=True)
+        cog_path.unlink(missing_ok=True)

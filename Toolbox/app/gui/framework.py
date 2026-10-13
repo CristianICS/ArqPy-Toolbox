@@ -25,8 +25,24 @@ from sensors import SENSORS
 
 from .icon_base64 import ICON
 from core.clip import resolve_clip_vector
+from core.raster_io import LOSSLESS, NEAR_LOSSLESS
+
+# GUI label -> `core.raster_io` compression mode.
+COMPRESSION_LABELS = {
+    "Lossless": LOSSLESS,
+    "Near-lossless": NEAR_LOSSLESS,
+}
 
 JobFn = Callable[[dict], object]
+
+# Key of the scrollable column that holds each tool's form rows.
+FORM_KEY = "-FORM-"
+# Fraction of the screen height the window may take on open, leaving room
+# for the title bar and the taskbar.
+MAX_SCREEN_FRACTION = 0.85
+# The form never shrinks below this height (pixels), so a few rows stay
+# visible even on very small screens.
+MIN_FORM_HEIGHT = 150
 
 
 def report_job_result(result: object, success_message: str = "Processing completed successfully.") -> None:
@@ -79,14 +95,32 @@ class ToolWindow:
         return self
 
     def run(self, job: JobFn, *, start_message: str = "Starting processing...") -> None:
+        # The form rows live in a scrollable column, so tools with many
+        # options still fit on small screens; the title, Run/Exit and the
+        # Output log stay fixed outside it. `size_subsample_height=1` sizes
+        # the column to its full content; `_fit_to_screen` shrinks it only
+        # when the window would be taller than the screen.
+        form = sg.Column(
+            self.rows,
+            key=FORM_KEY,
+            scrollable=True,
+            vertical_scroll_only=True,
+            size_subsample_height=1,
+            expand_x=True,
+            expand_y=True,
+            pad=0,
+        )
         layout = [
             [sg.Text(self.title, font=("Arial", 16, "bold"))],
-            *self.rows,
+            [form],
             [sg.Button("Run"), sg.Button("Exit")],
-            [sg.Output(size=(80, 20))],
+            [sg.Output(size=(80, 20), expand_x=True, expand_y=True)],
         ]
 
-        window = sg.Window(self.window_title, layout, icon=ICON)
+        window = sg.Window(
+            self.window_title, layout, icon=ICON, resizable=True, finalize=True,
+        )
+        _fit_to_screen(window, window[FORM_KEY])
         try:
             while True:
                 event, values = window.read()
@@ -106,6 +140,20 @@ class ToolWindow:
                     report_job_result(values["-JOB-DONE-"])
         finally:
             window.close()
+
+
+def _fit_to_screen(window: sg.Window, form: sg.Column) -> None:
+    """Shrink the scrollable form so the whole window fits on the screen.
+    Only the form loses height; the title, Run/Exit and the Output log keep
+    their size. The window stays resizable, so the user can enlarge it again."""
+    window.refresh()
+    _, screen_h = sg.Window.get_screen_size()
+    overflow = window.TKroot.winfo_reqheight() - int(screen_h * MAX_SCREEN_FRACTION)
+    if overflow > 0:
+        canvas = form.TKColFrame.canvas
+        canvas.config(height=max(MIN_FORM_HEIGHT, canvas.winfo_reqheight() - overflow))
+        window.refresh()
+    window.move_to_center()
 
 
 def folder_input_row(key: str, label: str) -> list:
@@ -156,6 +204,37 @@ def sensor_combo_row(key: str = "-SENSOR-", default: str = "WV3") -> list:
             size=(20, 1),
         )],
     ]
+
+
+def compression_row(key: str = "-COMPRESSION-", warning: Optional[str] = None) -> list:
+    """Output-compression dropdown: lossless (bit-exact, the default) or
+    near-lossless (LERC with a bounded per-pixel error, much smaller).
+    `warning` adds a highlighted line below it, for tools whose outputs feed
+    further processing steps."""
+    rows = [
+        [sg.Text("Output compression"), sg.Combo(
+            list(COMPRESSION_LABELS.keys()),
+            key=key,
+            default_value="Lossless",
+            readonly=True,
+            size=(20, 1),
+        )],
+        [sg.Text(
+            "Near-lossless keeps float32 but allows a small, bounded error per pixel",
+            font=("Arial", 10, "italic"),
+        )],
+    ]
+    if warning:
+        rows.append([sg.Text(
+            warning, font=("Arial", 10, "bold"), text_color="orange",
+        )])
+    return rows
+
+
+def resolve_compression_value(values: dict, key: str = "-COMPRESSION-") -> str:
+    """Map the compression dropdown's label to a `core.raster_io` mode;
+    a missing/blank value means lossless."""
+    return COMPRESSION_LABELS.get(values.get(key) or "Lossless", LOSSLESS)
 
 
 def resolve_clip_vector_value(values: dict, key: str = "-CLIP_VECTOR-") -> Optional[Path]:

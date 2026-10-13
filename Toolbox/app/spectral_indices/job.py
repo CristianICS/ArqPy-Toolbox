@@ -12,18 +12,9 @@ from pathlib import Path
 from typing import List, Optional
 
 from core.progress import DEFAULT_PROGRESS, Progress
-from core.raster_io import RasterProfile
+from core.raster_io import COMPRESSION_MODES, LOSSLESS
 
 from .utils import MissingBandsError, compute_index, get_index_keys
-
-# Matches the creation-options list the pre-refactor GUI hardcoded for
-# every computed index (COMPRESS=DEFLATE, PREDICTOR=2, BIGTIFF=IF_SAFER);
-# `compute_index`'s own default profile (PREDICTOR=3, no BIGTIFF) is only
-# used by direct callers that don't pass one.
-_OUTPUT_PROFILE = RasterProfile(
-    compress="DEFLATE", predictor=2, tiled=False,
-    blockxsize=None, blockysize=None, bigtiff="IF_SAFER",
-)
 
 
 @dataclass(frozen=True)
@@ -39,12 +30,15 @@ class SpectralIndicesJob:
     sensor_band_pos: List[int]
     clip_vector: Optional[Path] = None
     overwrite: bool = False
+    compression: str = LOSSLESS
 
     def validate(self) -> None:
         if not self.img_path.exists():
             raise FileNotFoundError(f"Input image not found: {self.img_path}")
         if not self.out_folder.exists():
             raise NotADirectoryError(f"Output folder not found: {self.out_folder}")
+        if self.compression not in COMPRESSION_MODES:
+            raise ValueError(f"Unknown compression mode: {self.compression}")
 
     def run(self, progress: Progress = DEFAULT_PROGRESS) -> SpectralIndicesResult:
         computed_paths: List[Path] = []
@@ -60,7 +54,7 @@ class SpectralIndicesJob:
                     self.out_folder,
                     clip_layer_path=self.clip_vector,
                     overwrite=self.overwrite,
-                    profile=_OUTPUT_PROFILE,
+                    compression=self.compression,
                 )
             except MissingBandsError as e:
                 progress(f"Skipping {index_key}: {e}")

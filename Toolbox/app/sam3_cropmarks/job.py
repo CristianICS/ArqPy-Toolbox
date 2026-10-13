@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from core.progress import DEFAULT_PROGRESS, Progress
+from core.raster_io import COMPRESSION_MODES, LOSSLESS
 
 from .utils import SUPPORTED_EXTENSIONS, process_input
 
@@ -36,6 +37,7 @@ class Sam3CropmarksJob:
     overlap: int
     checkpoint: Optional[Path] = None
     overwrite: bool = False
+    compression: str = LOSSLESS
 
     def validate(self) -> None:
         if not self.input_path.exists():
@@ -59,6 +61,8 @@ class Sam3CropmarksJob:
             raise ValueError("Overlap must be non-negative and smaller than tile size.")
         if self.checkpoint is not None and not self.checkpoint.is_file():
             raise FileNotFoundError(f"SAM 3 checkpoint not found: {self.checkpoint}")
+        if self.compression not in COMPRESSION_MODES:
+            raise ValueError(f"Unknown compression mode: {self.compression}")
 
     def run(self, progress: Progress = DEFAULT_PROGRESS) -> Sam3CropmarksResult:
         results = process_input(
@@ -72,6 +76,7 @@ class Sam3CropmarksJob:
             checkpoint=self.checkpoint,
             overwrite=self.overwrite,
             progress=progress,
+            compression=self.compression,
         )
         skipped = sum(int(item["skipped"]) for item in results)
         return Sam3CropmarksResult(

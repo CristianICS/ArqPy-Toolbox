@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Literal, Optional, Tuple
 
 from core.progress import DEFAULT_PROGRESS, Progress
+from core.raster_io import COMPRESSION_MODES, LOSSLESS
 
 from .stats import compute_raster_stats, update_csv
 from .utils import (
@@ -43,6 +44,7 @@ class MaeJob:
     clip_vector: Optional[Path] = None
     tile_overlap: int = DEFAULT_TILE_OVERLAP
     normalization: Literal["per_tile", "global"] = "per_tile"
+    compression: str = LOSSLESS
 
     def validate(self) -> None:
         if not self.imgs_folder.is_dir():
@@ -55,6 +57,8 @@ class MaeJob:
             raise ValueError("Tile overlap must be between 0 and 511 (tile size is 512x512).")
         if self.normalization not in ("per_tile", "global"):
             raise ValueError(f"Unknown normalization mode: {self.normalization}")
+        if self.compression not in COMPRESSION_MODES:
+            raise ValueError(f"Unknown compression mode: {self.compression}")
 
     def run(self, progress: Progress = DEFAULT_PROGRESS) -> MaeResult:
         model, device = define_model(checkpoint_path=self.checkpoint)
@@ -72,16 +76,23 @@ class MaeJob:
                 compute_global_band_stats(img_path, self.bands)
                 if self.normalization == "global" else None
             )
-            tiles_meta, tiles_folder = tilling(img_path, overlap=self.tile_overlap)
+            tiles_meta, tiles_folder = tilling(
+                img_path, overlap=self.tile_overlap, compression=True,
+            )
 
+            # With a clip, the merged mosaic stays lossless and only the
+            # clipped output uses `compression`, so it is encoded once.
             compute_mae_batch(
                 tiles_meta, out_path, model, device,
                 bands=self.bands, band_stats=band_stats,
+                compression=(
+                    LOSSLESS if self.clip_vector is not None else self.compression
+                ),
             )
 
             if self.clip_vector is not None:
                 progress("Perform clip operation...")
-                clip_mae(out_path, self.clip_vector)
+                clip_mae(out_path, self.clip_vector, compression=self.compression)
 
             shutil.rmtree(tiles_folder)
 

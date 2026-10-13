@@ -7,8 +7,10 @@ from highpass.job import HighPassJob
 from .framework import (
     ToolWindow,
     clip_vector_row,
+    compression_row,
     output_folder_row,
     resolve_clip_vector_value,
+    resolve_compression_value,
     resolve_output_folder_value,
 )
 
@@ -42,6 +44,7 @@ def run_job(values: dict):
             out_folder=out_folder,
             band=band,
             clip_vector=clip_vector,
+            compression=resolve_compression_value(values),
         )
         job.validate()
         job.run(progress=print)
@@ -67,4 +70,5 @@ def main():
     )
     tw.add_rows(*output_folder_row("-OUT-"))
     tw.add_rows(*clip_vector_row())
+    tw.add_rows(*compression_row())
     tw.run(job=run_job, start_message="Starting computations...")

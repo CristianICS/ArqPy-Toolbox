@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from math import ceil, floor
 from pathlib import Path
 
-from osgeo import gdal, osr
+from osgeo import gdal, gdal_array, osr
 
-from core.raster_io import RasterProfile, gdal_creation_options
+from core.raster_io import gdal_creation_options, profile_for
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,16 @@ def _extent(dataset, transform):
     right = left + dataset.RasterXSize * transform[1]
     bottom = top + dataset.RasterYSize * transform[5]
     return left, bottom, right, top
+
+
+def _creation_options(dataset) -> list[str]:
+    """Lossless DEFLATE options with the predictor derived from the band
+    dtype that ``gdal.Warp`` keeps (3 for floats, 2 for integers)."""
+    dtype = gdal_array.GDALTypeCodeToNumericTypeCode(
+        dataset.GetRasterBand(1).DataType)
+    return gdal_creation_options(profile_for(
+        dtype, blockxsize=None, blockysize=None, bigtiff=None,
+    ))
 
 
 def _same_crs(first, second) -> bool:
@@ -138,10 +148,6 @@ def align_raster_grids(
             "outputBounds": bounds,
             "dstSRS": ms.GetProjection(),
             "multithread": True,
-            "creationOptions": gdal_creation_options(RasterProfile(
-                compress="DEFLATE", predictor=2, tiled=True,
-                blockxsize=None, blockysize=None, bigtiff=None,
-            )),
             "warpOptions": ["NUM_THREADS=ALL_CPUS"],
         }
         ms_output = gdal.Warp(
@@ -151,6 +157,7 @@ def align_raster_grids(
                 width=ms_width,
                 height=ms_height,
                 resampleAlg="bilinear",
+                creationOptions=_creation_options(ms),
                 **common_options,
             ),
         )
@@ -165,6 +172,7 @@ def align_raster_grids(
                 width=pan_width,
                 height=pan_height,
                 resampleAlg="cubic",
+                creationOptions=_creation_options(pan),
                 **common_options,
             ),
         )

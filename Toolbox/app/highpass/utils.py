@@ -5,11 +5,24 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
-from osgeo import gdal
+from osgeo import gdal, gdal_array
 
 from core.clip import clip_raster_to_vector
-from core.raster_io import RasterProfile, create_gtiff_like
+from core.raster_io import (
+    COMPRESSION_MODES,
+    LOSSLESS,
+    NEAR_LOSSLESS,
+    create_gtiff_like,
+    percentile_range,
+    profile_for,
+    temp_tif,
+    translate_to_cog,
+)
 from core.tiling import iter_blocks
+
+# Longest side of the decimated read used to estimate an output's p99 - p1
+# (the near-lossless `value_range`).
+RANGE_SAMPLE_SIZE = 2048
 
 
 @dataclass(frozen=True)
@@ -66,6 +79,9 @@ class GDALHighPassFilter:
     Example:
         hp = GDALHighPassFilter(Path("in.tif"))
         hp.run_all(Path("out/corona_hp"))
+
+    `compression` (a `core.raster_io` mode) only applies to the final COGs
+    written by `run_all`; the `apply_*` methods always write lossless.
     """
 
     def __init__(
@@ -73,14 +89,14 @@ class GDALHighPassFilter:
         input_path: Path,
         band_index: int = 1,
         block: int = 1024,
-        compress: str = "DEFLATE",
-        bigtiff: str = "IF_SAFER",
+        compression: str = LOSSLESS,
     ) -> None:
+        if compression not in COMPRESSION_MODES:
+            raise ValueError(f"Unknown compression mode: {compression}")
         self.input_path = Path(input_path)
         self.band_index = int(band_index)
         self.block = int(block)
-        self.compress = compress
-        self.bigtiff = bigtiff
+        self.compression = compression
 
         self._ds = gdal.Open(str(self.input_path), gdal.GA_ReadOnly)
         if self._ds is None:
@@ -106,44 +122,30 @@ class GDALHighPassFilter:
           - highboost
           - GLCM local contrast high-pass texture response
 
-        Returns output paths in that order.
+        Returns output paths in that order. Each filter is computed into a
+        lossless temporary file, then written as a COG (clipped to
+        `clip_layer_path` if given) with `self.compression`.
         """
-        sfx = "_temp" if clip_layer_path else ""
-
         out_prefix = Path(out_prefix)
         out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-        # Create output names and paths
-        lap_path = out_prefix.with_name(out_prefix.name + f"_laplacian{sfx}.tif")
-        log_path = out_prefix.with_name(out_prefix.name + f"_log5{sfx}.tif")
-        sob_path = out_prefix.with_name(out_prefix.name + f"_sobel_mag{sfx}.tif")
-        hbt_path = out_prefix.with_name(out_prefix.name + f"_highboost{sfx}.tif")
-        glcm_path = out_prefix.with_name(out_prefix.name + f"_glcm_contrast{sfx}.tif")
+        filters = (
+            ("laplacian", lambda p: self.apply_kernel(HighPassKernels.LAPLACIAN_4N, p)),
+            ("log5", lambda p: self.apply_kernel(HighPassKernels.LOG_5, p)),
+            ("sobel_mag", self.apply_sobel_magnitude),
+            ("highboost", lambda p: self.apply_kernel(HighPassKernels.HIGHBOOST_3, p)),
+            ("glcm_contrast", self.apply_glcm_contrast_highpass),
+        )
 
-        lap = self.apply_kernel(HighPassKernels.LAPLACIAN_4N, lap_path)
-        log = self.apply_kernel(HighPassKernels.LOG_5, log_path)
-        sob = self.apply_sobel_magnitude(sob_path)
-        hbt = self.apply_kernel(HighPassKernels.HIGHBOOST_3, hbt_path)
-        glcm = self.apply_glcm_contrast_highpass(glcm_path)
+        output_paths = []
+        for suffix, compute in filters:
+            out_path = out_prefix.with_name(f"{out_prefix.name}_{suffix}.tif")
+            with temp_tif(out_path.parent, f"{out_path.stem}_temp") as tmp_path:
+                compute(tmp_path)
+                self._write_final(tmp_path, out_path, clip_layer_path)
+            output_paths.append(out_path)
 
-        if clip_layer_path:
-            clip_profile = RasterProfile(compress="DEFLATE", predictor=3, bigtiff="IF_SAFER")
-            for lpath in [lap_path, log_path, sob_path, hbt_path, glcm_path]:
-                clip_out = lpath.with_name(lpath.name.replace(sfx, ""))
-                clip_raster_to_vector(
-                    lpath, clip_layer_path, clip_out,
-                    profile=clip_profile,
-                    as_cog=True,
-                )
-                lpath.unlink()
-
-            lap = lap.with_name(lap.name.replace(sfx, ""))
-            log = log.with_name(log.name.replace(sfx, ""))
-            sob = sob.with_name(sob.name.replace(sfx, ""))
-            hbt = hbt.with_name(hbt.name.replace(sfx, ""))
-            glcm = glcm.with_name(glcm.name.replace(sfx, ""))
-
-        return lap, log, sob, hbt, glcm
+        return tuple(output_paths)
 
     def apply_kernel(self, kernel: np.ndarray, out_path: Path) -> Path:
         out_path = Path(out_path)
@@ -263,6 +265,7 @@ class GDALHighPassFilter:
     # Internals
     # -------------------------
     def _create_output_like(self, out_path: Path, dtype=gdal.GDT_Float32) -> gdal.Dataset:
+        """Create a lossless single-band GTiff on the input's grid."""
         out_ds = create_gtiff_like(
             out_path,
             self._ds.RasterXSize,
@@ -271,14 +274,52 @@ class GDALHighPassFilter:
             dtype,
             geotransform=self._ds.GetGeoTransform(),
             projection=self._ds.GetProjection(),
-            profile=RasterProfile(
-                compress=self.compress, predictor=3, tiled=True,
-                blockxsize=None, blockysize=None, bigtiff=self.bigtiff,
-            ),
+            profile=profile_for(gdal_array.GDALTypeCodeToNumericTypeCode(dtype)),
         )
         if self.nodata is not None:
             out_ds.GetRasterBand(1).SetNoDataValue(self.nodata)
         return out_ds
+
+    def _write_final(self, src_path: Path, out_path: Path,
+                     clip_layer_path: str | bool) -> None:
+        """Write the lossless `src_path` to `out_path` as a COG with
+        `self.compression`, clipped to `clip_layer_path` if given."""
+        value_range = (
+            self._output_value_range(src_path)
+            if self.compression == NEAR_LOSSLESS else None
+        )
+        profile = profile_for(
+            "float32", "highpass", self.compression, value_range=value_range,
+        )
+        if clip_layer_path:
+            clip_raster_to_vector(
+                src_path, clip_layer_path, out_path,
+                profile=profile,
+                as_cog=True,
+            )
+        else:
+            translate_to_cog(src_path, out_path, profile)
+
+    def _output_value_range(self, path: Path) -> float:
+        """p99 - p1 of the valid pixels of a filter output, from a
+        decimated (nearest-neighbour) read of at most RANGE_SAMPLE_SIZE
+        pixels per side."""
+        ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+        if ds is None:
+            raise RuntimeError(f"Could not open filter output: {path}")
+        try:
+            xsize, ysize = ds.RasterXSize, ds.RasterYSize
+            step = max(1, -(-max(xsize, ysize) // RANGE_SAMPLE_SIZE))
+            arr = ds.GetRasterBand(1).ReadAsArray(
+                buf_xsize=-(-xsize // step), buf_ysize=-(-ysize // step),
+            ).astype(np.float32)
+        finally:
+            ds = None
+
+        valid = np.isfinite(arr)
+        if self.nodata is not None and not np.isnan(self.nodata):
+            valid &= arr != self.nodata
+        return percentile_range(arr[valid])
 
     def _valid_minmax(self, band: gdal.Band) -> Tuple[float, float]:
         """Chunked min/max that excludes NoData, including NaN NoData."""
