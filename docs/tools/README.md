@@ -45,7 +45,7 @@ The tolerance depends on the product:
 | SAM 3 confidence | 1e-3 |
 | MAE saliency, high-pass filters | 0.1 % of the output's value range (99th minus 1st percentile) |
 
-Integer outputs are always lossless, whatever the option says: reflectance scaled to integers (atmospheric correction with **Scale** above 0, and pansharpening of two integer inputs), the SAM 3 mask, and deep-learning pansharpening. Overviews of near-lossless Cloud Optimized GeoTIFFs are always lossless (DEFLATE), so zoomed-out views show no compression artifacts. Overviews are built with average resampling.
+Integer outputs are always lossless, whatever the option says: reflectance scaled to integers (atmospheric correction with **Scale** above 0, and pansharpening of two integer inputs), the SAM 3 mask, and deep-learning pansharpening. Overviews of near-lossless Cloud Optimized GeoTIFFs use a tolerance ten times larger, because they are only used for display. Overviews are built with average resampling.
 
 ### Chaining tools: keep intermediate outputs lossless
 
