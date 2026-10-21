@@ -16,6 +16,8 @@ from core.progress import DEFAULT_PROGRESS, Progress
 from core.raster_io import COMPRESSION_MODES, LOSSLESS, nodata_for
 
 from .utils import (
+    DEFAULT_RESAMPLING,
+    RESAMPLING_METHODS,
     SENSORS,
     bayesian,
     brovey,
@@ -42,6 +44,8 @@ class PansharpJob:
     bayes_lambda: float = 0.995
     clip_vector: Optional[Path] = None
     compression: str = LOSSLESS
+    # MUL -> PAN grid alignment, one of `RESAMPLING_METHODS`.
+    resampling: str = DEFAULT_RESAMPLING
 
     def validate(self) -> None:
         if not self.mul_path.exists():
@@ -61,6 +65,8 @@ class PansharpJob:
             raise ValueError(f"Unknown sensor: {self.sensor_name}")
         if self.compression not in COMPRESSION_MODES:
             raise ValueError(f"Unknown compression mode: {self.compression}")
+        if self.resampling not in RESAMPLING_METHODS:
+            raise ValueError(f"Unknown resampling method: {self.resampling}")
         if self.method == "Bayesian" and not (0 <= self.bayes_lambda <= 1):
             raise ValueError(
                 "The valid range of Bayes' lambda parameter is 0-1."
@@ -86,6 +92,7 @@ class PansharpJob:
             bayesian(
                 self.mul_path, self.pan_path, out_path, self.bayes_lambda,
                 compression=pansharp_compression, dtype=dtype,
+                resample=self.resampling,
             )
         else:
             progress("Starting weighted Brovey pansharpening...")
@@ -93,6 +100,7 @@ class PansharpJob:
             brovey(
                 sensor, self.mul_path, self.pan_path, out_path,
                 compression=pansharp_compression, dtype=dtype,
+                resample=self.resampling,
             )
 
             if self.sensor_name == "WV3":
@@ -100,7 +108,7 @@ class PansharpJob:
                 lmnv_path = sensor.lmnv(
                     self.mul_path, self.pan_path,
                     compression=pansharp_compression, dtype=dtype,
-                    suffix=suffix,
+                    suffix=suffix, resample=self.resampling,
                 )
 
         if self.clip_vector is not None:

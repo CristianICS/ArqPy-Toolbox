@@ -15,6 +15,13 @@ from .framework import (
     resolve_output_folder_value,
 )
 
+# GUI label -> `pansharp.utils.RESAMPLING_METHODS` entry.
+RESAMPLING_LABELS = {
+    "Nearest": "near",
+    "Bilinear": "bilinear",
+    "Cubic": "cubic",
+}
+
 
 def run_job(values: dict):
     """Perform a pansharpening operation."""
@@ -56,6 +63,7 @@ def run_job(values: dict):
             bayes_lambda=bayes_lambda,
             clip_vector=clip_vector,
             compression=resolve_compression_value(values),
+            resampling=RESAMPLING_LABELS[values["-RESAMPLING-"]],
         )
         job.validate()
         job.run(progress=print)
@@ -95,6 +103,17 @@ def main():
             default_value="Bayesian",
             readonly=True,
             size=(20, 1)
+        )],
+        [sg.Text("MUL resampling"), sg.Combo(
+            list(RESAMPLING_LABELS.keys()),
+            key="-RESAMPLING-",
+            default_value="Bilinear",
+            readonly=True,
+            size=(20, 1)
+        )],
+        [sg.Text(
+            "How the MUL image is aligned to the PAN grid. Nearest keeps the original values but leaves square blocks",
+            font=("Arial", 9, "italic")
         )],
         [sg.Text("If Bayesian algorithm is selected, define a valid 'lambda' parameter.")],
         [sg.Text(

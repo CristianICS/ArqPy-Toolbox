@@ -24,6 +24,12 @@ _OTB_DTYPE = "float32"
 
 LMVM_STEM = "B08_NIR2_Plmvm"
 
+# `gdal.Warp` resampling algorithms offered to align the MUL image onto the
+# PAN grid (see `_align_to_pan`). Bilinear is the default: it never
+# overshoots and, unlike nearest, leaves no MUL-pixel blocks in the output.
+RESAMPLING_METHODS = ("near", "bilinear", "cubic")
+DEFAULT_RESAMPLING = "bilinear"
+
 # LMVM matches local statistics over a window of 3 pixels around each
 # pixel. Closer than that to a no-data pixel the window reaches into the
 # filled area and the result is unreliable, so those pixels become no-data.
@@ -170,9 +176,11 @@ class Sensor:
 class WV3(Sensor):
 
     def lmnv(self, mul_img_path: Path, pan_img_path: Path,
-             compression: str = LOSSLESS, dtype=_OTB_DTYPE, suffix: str = ""):
+             compression: str = LOSSLESS, dtype=_OTB_DTYPE, suffix: str = "",
+             resample: str = DEFAULT_RESAMPLING):
         """Pansharpen the NIR2 band with LMVM. `suffix` is appended to the
-        output stem (the job's pre-clip "_temp" marker)."""
+        output stem (the job's pre-clip "_temp" marker); `resample` aligns
+        NIR2 onto the PAN grid (one of `RESAMPLING_METHODS`)."""
 
         otb_exe = find_otb_executable()
         otb_co = _otb_output_co()
@@ -180,7 +188,7 @@ class WV3(Sensor):
         tmp_dir = mul_img_path.parent
         # ONLY band 8 (NIR2) of the MUL image, on the PAN grid.
         with _otb_inputs(
-            mul_img_path, pan_img_path, tmp_dir, "bilinear", bands=[8],
+            mul_img_path, pan_img_path, tmp_dir, resample, bands=[8],
         ) as (pan_in, nir2_pan_path, valid_path), \
                 temp_tif(tmp_dir, "WV3_NIR2_lmvm") as lmvm_temp_path:
 
@@ -238,16 +246,18 @@ def brovey(
     out_path,
     compression: str = LOSSLESS,
     dtype=_OTB_DTYPE,
+    resample: str = DEFAULT_RESAMPLING,
 ):
     """Run weighted Brovey pansharpen operation. OTB computes in float32;
-    the final COG is converted to `dtype` (see `output_dtype`)."""
+    the final COG is converted to `dtype` (see `output_dtype`). `resample`
+    aligns the MUL image onto the PAN grid (one of `RESAMPLING_METHODS`)."""
     otb_exe = find_otb_executable()
     otb_co = _otb_output_co()
 
     tmp_dir = out_path.parent
     # The MUL image aligned with the PAN dimensions.
     with _otb_inputs(
-        mul_img_path, pan_img_path, tmp_dir, "bilinear",
+        mul_img_path, pan_img_path, tmp_dir, resample,
     ) as (pan_in, mul_temp_path, valid_path), \
             temp_tif(tmp_dir, f"{out_path.stem}_btemp") as out_path_temp:
 
@@ -267,11 +277,13 @@ def brovey(
 
 
 def bayesian(mul_img_path, pan_img_path, out_path, bayes_lambda=0.995,
-             compression: str = LOSSLESS, dtype=_OTB_DTYPE):
+             compression: str = LOSSLESS, dtype=_OTB_DTYPE,
+             resample: str = DEFAULT_RESAMPLING):
     """
     OTB CLI command for Bayesian pansharpening using the Pansharpening application.
     OTB computes in float32; the final COG is converted to `dtype` (see
-    `output_dtype`).
+    `output_dtype`). `resample` aligns the MUL image onto the PAN grid (one
+    of `RESAMPLING_METHODS`).
         """
     otb_exe = find_otb_executable()
     otb_co = _otb_output_co()
@@ -281,7 +293,7 @@ def bayesian(mul_img_path, pan_img_path, out_path, bayes_lambda=0.995,
     # Bayesian statistics over the whole image, so no-data is filled with
     # the band means.
     with _otb_inputs(
-        mul_img_path, pan_img_path, tmp_dir, "near", fill_mean=True,
+        mul_img_path, pan_img_path, tmp_dir, resample, fill_mean=True,
     ) as (pan_in, mul_temp_path, valid_path), \
             temp_tif(tmp_dir, f"{out_path.stem}_btemp") as out_temp_path:
 
