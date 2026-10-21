@@ -32,9 +32,11 @@ class RasterProfile:
     bigtiff: Optional[str] = "IF_SAFER"
     # Absolute per-pixel error bound; only meaningful with a LERC codec.
     max_z_error: Optional[float] = None
-    # Error bound for COG overviews (None = same as `max_z_error`); only
-    # rendered by `cog_creation_options`.
-    max_z_error_overview: Optional[float] = None
+    # COG overview codec/predictor (None = same as the full-resolution
+    # band) and overview resampling; only rendered by `cog_creation_options`.
+    overview_compress: Optional[str] = None
+    overview_predictor: Optional[int] = None
+    resampling: Optional[str] = "AVERAGE"
 
 
 LOSSLESS = "lossless"
@@ -66,10 +68,11 @@ PRODUCT_RELATIVE_MAX_Z_ERROR = {
     "highpass": 1e-3,
 }
 
-# COG overviews are only used for display, so their MAX_Z_ERROR is this
-# factor times the full-resolution one (COG `MAX_Z_ERROR_OVERVIEW`, GDAL
-# >= 3.8). The full-resolution band, which analyses read, keeps its bound.
-OVERVIEW_MAX_Z_ERROR_FACTOR = 10.0
+# COG overviews of a near-lossless output are written lossless with this
+# codec (COG `OVERVIEW_COMPRESS`, GDAL >= 3.6): LERC's block quantization
+# shows as blocky artifacts once a viewer stretches the overviews, and the
+# overviews are only ~1/3 of the full-resolution pixels, so it saves little.
+OVERVIEW_LOSSLESS_CODEC = "DEFLATE"
 
 
 def _near_lossless_max_z_error(
@@ -106,7 +109,8 @@ def profile_for(
     MAX_Z_ERROR (`PRODUCT_MAX_Z_ERROR`, or `PRODUCT_RELATIVE_MAX_Z_ERROR`
     scaled by `value_range`), for float outputs only; anything without a
     tolerance falls back to lossless. COG overviews of a near-lossless
-    output get a looser bound (`OVERVIEW_MAX_Z_ERROR_FACTOR`).
+    output are lossless (`OVERVIEW_LOSSLESS_CODEC`, floating-point
+    predictor). COG overviews are always resampled with AVERAGE.
     """
     if mode not in COMPRESSION_MODES:
         raise ValueError(f"Unknown compression mode: {mode}")
@@ -122,7 +126,7 @@ def profile_for(
             return RasterProfile(
                 compress=NEAR_LOSSLESS_CODEC, predictor=None,
                 max_z_error=max_z_error,
-                max_z_error_overview=max_z_error * OVERVIEW_MAX_Z_ERROR_FACTOR,
+                overview_compress=OVERVIEW_LOSSLESS_CODEC, overview_predictor=3,
                 **layout,
             )
     return RasterProfile(
@@ -179,8 +183,12 @@ def cog_creation_options(profile: RasterProfile = RasterProfile()) -> list[str]:
         options.append(f"PREDICTOR={profile.predictor}")
     if profile.max_z_error is not None:
         options.append(f"MAX_Z_ERROR={profile.max_z_error:g}")
-    if profile.max_z_error_overview is not None:
-        options.append(f"MAX_Z_ERROR_OVERVIEW={profile.max_z_error_overview:g}")
+    if profile.overview_compress:
+        options.append(f"OVERVIEW_COMPRESS={profile.overview_compress}")
+    if profile.overview_predictor is not None:
+        options.append(f"OVERVIEW_PREDICTOR={profile.overview_predictor}")
+    if profile.resampling:
+        options.append(f"RESAMPLING={profile.resampling}")
     if profile.bigtiff:
         options.append(f"BIGTIFF={profile.bigtiff}")
     return options
